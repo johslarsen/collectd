@@ -299,6 +299,51 @@ static void sensor_read_handler(ipmi_sensor_t *sensor, int err,
   plugin_dispatch_values(&vl);
 } /* void sensor_read_handler */
 
+static void sensor_states_handler(ipmi_sensor_t *sensor, int err,
+                                  ipmi_states_t *states, void *user_data) {
+  value_list_t vl = VALUE_LIST_INIT;
+  c_ipmi_sensor_list_t *list_item = user_data;
+  c_ipmi_instance_t *st = list_item->instance;
+
+  list_item->use--;
+
+  if (err != 0) {
+    INFO("ipmi_plugin: sensor_states_handler: Sensor `%s` of `%s` error: %d",
+         list_item->sensor_name, st->name, err);
+    return;
+  }
+
+  unsigned flags = 0;
+  /* TODO: check internal openipmi endian of states representation. IPMI fields
+   * are suppose to be little-endian, and this produce the same result as
+   * ipmitool via LAN (i.e. big-endian) on a little-endian machine. */
+  for (int lsb = 0; lsb < 8; lsb++) {
+    if (ipmi_is_state_set(states, lsb))
+      flags |= 1 << (lsb + 8);
+  } /* for (lsb) */
+  for (int lsb = 8; lsb < 16; lsb++) {
+    if (ipmi_is_state_set(states, lsb))
+      flags |= 1 << (lsb - 8);
+  } /* for (lsb) */
+
+  DEBUG("ipmi_plugin: sensor_states_handler: Sensor `%s` of `%s` states: %x",
+        list_item->sensor_name, st->name, flags);
+
+  double value = flags;
+
+  vl.values = &(value_t){.gauge = value};
+  vl.values_len = 1;
+
+  if (st->host != NULL)
+    sstrncpy(vl.host, st->host, sizeof(vl.host));
+  sstrncpy(vl.plugin, "ipmi", sizeof(vl.plugin));
+  sstrncpy(vl.type, list_item->sensor_type, sizeof(vl.type));
+  sstrncpy(vl.type_instance, list_item->type_instance,
+           sizeof(vl.type_instance));
+
+  plugin_dispatch_values(&vl);
+} /* void sensor_states_handler */
+
 static void sensor_get_name(ipmi_sensor_t *sensor, char *buffer, int buf_len) {
   char temp[DATA_MAX_NAME_LEN] = {0};
   ipmi_entity_t *ent = ipmi_sensor_get_entity(sensor);
@@ -414,8 +459,8 @@ static int sensor_list_add(c_ipmi_instance_t *st, ipmi_sensor_t *sensor) {
     return -1;
   }
 
-  if (ipmi_sensor_get_event_reading_type(sensor) !=
-      IPMI_EVENT_READING_TYPE_THRESHOLD) {
+  if (false && ipmi_sensor_get_event_reading_type(sensor) !=
+                   IPMI_EVENT_READING_TYPE_THRESHOLD) {
     INFO("ipmi plugin: sensor_list_add: Ignore sensor `%s` of `%s`, "
          "because it is discrete (%#x)! Its type: (%#x, %s). ",
          sensor_name_ptr, st->name, sensor_type,
@@ -450,15 +495,8 @@ static int sensor_list_add(c_ipmi_instance_t *st, ipmi_sensor_t *sensor) {
     if ((type = sensor_unit_to_type(sensor)) != NULL)
       break;
 
-    INFO("ipmi plugin: sensor_list_add: Ignore sensor `%s` of `%s`, "
-         "because I don't know how to handle its units (%#x, %#x, %#x). "
-         "Sensor type: (%#x, %s). If you need this sensor, please file "
-         "a bug report at http://collectd.org/.",
-         sensor_name_ptr, st->name, ipmi_sensor_get_base_unit(sensor),
-         ipmi_sensor_get_modifier_unit(sensor),
-         ipmi_sensor_get_rate_unit(sensor), sensor_type,
-         ipmi_sensor_get_sensor_type_string(sensor));
-    return -1;
+    type = "states";
+    break;
   }
   } /* switch (sensor_type) */
 
@@ -585,8 +623,13 @@ static int sensor_list_read_all(c_ipmi_instance_t *st) {
       continue;
 
     list_item->use++;
-    ipmi_sensor_id_get_reading(list_item->sensor_id, sensor_read_handler,
-                               /* user data = */ (void *)list_item);
+    if (strcmp(list_item->sensor_type, "states") == 0) {
+      ipmi_sensor_id_get_states(list_item->sensor_id, sensor_states_handler,
+                                /* user data = */ (void *)list_item);
+    } else {
+      ipmi_sensor_id_get_reading(list_item->sensor_id, sensor_read_handler,
+                                 /* user data = */ (void *)list_item);
+    }
   } /* for (list_item) */
 
   pthread_mutex_unlock(&st->sensor_list_lock);
